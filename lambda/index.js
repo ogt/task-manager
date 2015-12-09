@@ -95,9 +95,20 @@ format_task_item = function(task) {
         result.description = task.Description.S;
     }
 
-    result.deadline = format_date(parseInt(task.Deadline.N));
+    if (task.Deadline) {
+        result.deadline = format_date(parseInt(task.Deadline.N));
+    }
+
+    if (task.Priority) {
+        result.priority = task.Priority.N;
+    }
+
     if (task.Estimate) {
         result.estimate = task.Estimate.N;
+    }
+
+    if (task.Instructions) {
+        result.instructions = task.Instructions.S;
     }
 
     result.owner = task.Owner.S;
@@ -171,6 +182,17 @@ output_task_item = function(event, context, task) {
     }
 }
 
+compare_task_by_created_on = function(a, b) {
+    if (parseInt(a.CreatedOn.N) < parseInt(b.CreatedOn.N)) {
+        return -1;
+    }
+    if (parseInt(a.CreatedOn.N) > parseInt(b.CreatedOn.N)) {
+        return 1;
+    }
+
+    return 0;
+}
+
 get = function(event, context) {
     if (event.task_id != undefined && event.task_id != "") {
         var task_id = parseInt(event.task_id);
@@ -212,6 +234,9 @@ add_task_item = function(event, context, user_id, db_item) {
             }
         }
         db_item = validate_number("Priority", body.priority, db_item);
+        if (!db_item.Priority) {
+            db_item.Priority = {N: "0"};
+        }
         db_item = validate_number("Estimate", body.estimate, db_item);
         db_item = validate_string("Description", body.description, db_item);
         if (body.tags != undefined && Array.isArray(body.tags)) {
@@ -227,6 +252,9 @@ add_task_item = function(event, context, user_id, db_item) {
                     SS: body.tags
                 };
             }
+        }
+        if (body.instructions != undefined && body.instructions != "") {
+            db_item["Instructions"] = {S: body.instructions};
         }
 
         save_item = function(user_id, event, context, db_item) {
@@ -460,6 +488,124 @@ history = function(event, context) {
     }
 }
 
+worker_jobs = function(event, context) {
+    if (event.user_email != undefined && event.user_email != "") {
+        dynamodb.scan({
+            TableName: "TaskManager_Tasks",
+            ExpressionAttributeNames: {
+                "#grabbed_by": "GrabbedBy"
+            },
+            ExpressionAttributeValues: {
+                ":grabbed_by": {S: event.user_email}
+            },
+            FilterExpression: "#grabbed_by = :grabbed_by"
+        }, function(err, data) {
+            if (err) {
+                console.log(err);
+                fail_message(event, context, "Oops... looks like something is wrong! Try again later");
+            } else {
+                if (data.Items.length > 0) {
+                    var output = [];
+                    for (var task_index = 0; task_index < data.Items.length; task_index++) {
+                        var task = data.Items[task_index];
+                        if (task.Status.N != TaskStatus.IN_QUEUE && task.Status.N != TaskStatus.DELETE && task.Status.N != TaskStatus.DONE) {
+                            output.push(format_task_item(task));
+                        }
+                    }
+
+                    context.succeed(output);
+                } else {
+                    fail_message(event, context, "No jobs currently grabbed");
+                }
+            }
+        });
+    }
+}
+
+worker_stats = function(event, context) {
+    if (event.worker != undefined && event.worker != "") {
+        var KeyConditionExpression = "#user = :user";
+        var ExpressionAttributeNames = {"#user": "User"};
+        var ExpressionAttributeValues = {":user": {S: event.worker}};
+        if (event.from != undefined && event.from != "") {
+            var start = parseInt(event.from);
+            if (!isNaN(start)) {
+                KeyConditionExpression += " AND #date >= :start";
+                ExpressionAttributeNames["#date"] = "Date";
+                ExpressionAttributeValues[":start"] = {N: start.toString()};
+            }
+        }
+        if (event.to != undefined && event.to != "") {
+            var end = parseInt(event.to);
+            if (!isNaN(end)) {
+                KeyConditionExpression += " AND #date <= :end";
+                ExpressionAttributeNames["#date"] = "Date";
+                ExpressionAttributeValues[":end"] = {N: end.toString()};
+            }
+        }
+        dynamodb.query({
+            TableName: "TaskManager_Events",
+            ExpressionAttributeNames: ExpressionAttributeNames,
+            ExpressionAttributeValues: ExpressionAttributeValues,
+            KeyConditionExpression: KeyConditionExpression,
+            ScanIndexForward: true,
+        }, function(err, data) {
+            if (err) {
+                console.log(err);
+                fail_message(event, context, "Oops, looks like something went wrong...");
+            } else {
+                var session_count = 0;
+                var total_session_length = 0;
+                var tasks_grabbed = 0;
+                var tasks_completed = 0;
+                var tasks_completed_successfully = 0;
+                var rejection = 0;
+                var failure = 0;
+                if (data.Items.length > 0) {
+                    var session_start = 0;
+                    for (var item_index = 0; item_index < data.Items.length; item_index++) {
+                        var item = data.Items[item_index];
+                        if (item.Action.S == "login") {
+                            session_start = parseInt(item["Date"].N);
+                            session_count++;
+                        }
+                        if (item.Action.S == "logout" && session_start > 0) {
+                            total_session_length += (parseInt(item["Date"].N) - session_start);
+                            session_start = 0;
+                        }
+                        if (item.Action.S == "grab") {
+                            tasks_grabbed++;
+                        }
+                        if (item.Action.S == "complete-success") {
+                            tasks_completed++;
+                            tasks_completed_successfully++;
+                        }
+                        if (item.Action.S == "complete-failure") {
+                            tasks_completed++;
+                            failure++;
+                        }
+                        if (item.Action.S == "release") {
+                            rejection++;
+                        }
+                    }
+                }
+
+                context.succeed({
+                    "avg_session_length": (session_count > 0) ? total_session_length / session_count : 0,
+                    "num_of_sessions": session_count,
+                    "tasks_grabbed": tasks_grabbed,
+                    "tasks_completed": tasks_completed,
+                    "tasks_completed_successfully": tasks_completed_successfully,
+                    "rejection_ratio": (tasks_grabbed > 0) ? rejection / tasks_grabbed : 0,
+                    "failure_ratio": (tasks_completed > 0) ? failure / tasks_completed : 0,
+                });
+            }
+        });
+    } else {
+        fail_message(event, context, "You need to specify a worker");
+    }
+}
+
 events = function(event, context) {
     print_events = function(event, context, data, limit) {
         var result = [];
@@ -498,7 +644,7 @@ events = function(event, context) {
                 params.ExpressionAttributeNames["#action"] = "Action";
                 params.ExpressionAttributeValues[":login"] = {S: "login"};
                 params.ExpressionAttributeValues[":logout"] = {S: "logout"};
-                params.KeyConditionExpression += " and #action IN (:login, :logout)";
+                params.FilterExpression = "#action IN (:login, :logout)";
             } else {
                 switch (event.type) {
                     case "add":
@@ -527,12 +673,13 @@ events = function(event, context) {
         var limit = -1;
         if (event.n != "") {
             limit = parseInt(event.n);
-            if (!isNaN(limit)) {
+            if (!isNaN(limit) && limit > 0) {
                 params.Limit = limit*5;
+                limit = params.Limit;
             }
         }
 
-        return {params: params, hasError: hasErrors};
+        return {params: params, hasError: hasErrors, limit: limit};
     }
 
     if (event.user != "") {
@@ -551,10 +698,11 @@ events = function(event, context) {
         if (!parse_result.hasErrors) {
             dynamodb.query(parse_result.params, function(err, data) {
                 if (err) {
+                    console.log(parse_result.params);
                     console.log(err);
                     fail_message(event, context, "Oops... something went wrong");
                 } else {
-                    print_events(event, context, data, limit);
+                    print_events(event, context, data, parse_result.limit);
                 }
             });
         }
@@ -585,41 +733,6 @@ events = function(event, context) {
     } else {
         fail_message(event, context, "Please specify a user or task to filter!");
     }
-}
-
-peek = function(event, context, user_id) {
-    log_event(user_id, event.action, {}, function() {
-        dynamodb.query({
-            TableName: "TaskManager_Tasks",
-            ExpressionAttributeNames: {
-                "#status": "Status"
-            },
-            ExpressionAttributeValues: {
-                ":status": {N: TaskStatus.IN_QUEUE.toString()}
-            },
-            KeyConditionExpression: "#status = :status",
-            ScanIndexForward: false,
-            IndexName: "Status-Priority-Index",
-            Limit: 1
-        }, function(err, data) {
-            if (err) {
-                console.log(err);
-                context.succeed({text: "Oops, looks like there are some problems, please try again later!"});
-            } else {
-                if (data.Items.length > 0) {
-                    var task = data.Items[0];
-                    context.succeed({
-                        text: "Task ID: " + task.TaskId.S + "\n" +
-                            "Title: " + task.Title.S + "\n" +
-                            "- Dummy 1" + "\n" +
-                            "- Dummy 2"
-                    });
-                } else {
-                    context.succeed({text: "Looks like there's no job in the queue!"});
-                }
-            }
-        });
-    });
 }
 
 suspend_task = function(event, context, user_id, task, callback) {
@@ -920,6 +1033,63 @@ task_status = function(event, context, user_id) {
     }
 }
 
+get_available_task = function(event, context, n, callback) {
+    dynamodb.query({
+        TableName: "TaskManager_Tasks",
+        ExpressionAttributeNames: {
+            "#status": "Status"
+        },
+        ExpressionAttributeValues: {
+            ":status": {N: TaskStatus.IN_QUEUE.toString()}
+        },
+        KeyConditionExpression: "#status = :status",
+        IndexName: "Status-Priority-index",
+        ScanIndexForward: false
+    }, function(err, data) {
+        if (err) {
+            console.log("Failed to scan available tasks");
+            console.log(err);
+            fail_message(event, context, "Oops, looks like there are some problems, please try again later!");
+        } else {
+            if (data.Items.length > 0) {
+                // @Robustness If the result exceeds 1MB within the same priority status, the
+                // result might not be correct
+                var tasks = [];
+                var top_priority = data.Items[0].Priority.N;
+                for (var task_index = 0; task_index < data.Items.length; task_index++) {
+                    var task = data.Items[task_index];
+                    if (task.Priority.N != top_priority) {
+                        break;
+                    }
+                    tasks.push(task);
+                }
+                tasks.sort(compare_task_by_created_on);
+                callback(tasks.slice(0, n));
+            } else {
+                context.succeed({text: "There seems to be no tasks to work on at this time! Try again later"});
+            }
+        }
+    });
+}
+
+list_available = function(event, context) {
+    var n = 1;
+    if (event.n != undefined && event.n != "") {
+        var n_tmp = parseInt(event.n);
+        if (!isNaN(n_tmp)) {
+            n = n_tmp;
+        }
+    }
+    get_available_task(event, context, n, function(tasks) {
+        var result = [];
+        for (var task_index = 0; task_index < tasks.length; task_index++) {
+            result.push(format_task_item(tasks[task_index]));
+        }
+
+        context.succeed(result);
+    });
+}
+
 grab = function(event, context, user_id) {
     grab_task = function(task) {
         dynamodb.scan({
@@ -1012,28 +1182,8 @@ grab = function(event, context, user_id) {
             }
         });
     } else {
-        dynamodb.scan({
-            TableName: "TaskManager_Tasks",
-            ExpressionAttributeNames: {
-                "#status": "Status"
-            },
-            ExpressionAttributeValues: {
-                ":status": {N: TaskStatus.IN_QUEUE.toString()}
-            },
-            FilterExpression: "#status = :status"
-        }, function(err, data) {
-            if (err) {
-                console.log("Failed to scan available tasks");
-                console.log(err);
-                context.succeed({text: "Oops, looks like there are some problems, please try again later!"});
-            } else {
-                if (data.Items.length > 0) {
-                    var task = data.Items[0];
-                    grab_task(task);
-                } else {
-                    context.succeed({text: "There seems to be no tasks to work on at this time! Try again later"});
-                }
-            }
+        get_available_task(event, context, 1, function(tasks) {
+            grab_task(tasks[0]);
         });
     }
 }
@@ -1046,7 +1196,7 @@ get_user_item = function(item) {
         user.loggedin_on = format_date(item.LastLoggedIn.N);
     }
     if (item.Status && item.Status.N != "") {
-        switch (item.Status.N) {
+        switch (parseInt(item.Status.N)) {
             case UserStatus.IS_LOGGEDOUT:
                 user.status = "loggedout";
                 break;
@@ -1331,15 +1481,20 @@ login = function(event, context) {
                 console.log(err);
                 fail_message(event, context, "Failed to login");
             } else {
-                if (data.Item.Email.S) {
-                    log_event(data.Item.Email.S, event.action, {
+                if (data.Item) {
+                    var email = data.Item.Email.S;
+                    if (data.Item.SuperUser && data.Item.SuperUser.BOOL &&
+                            data.Item.EffectiveUser && data.Item.EffectiveUser.S != "") {
+                        email = data.Item.EffectiveUser.S;
+                    }
+                    log_event(email, event.action, {
                     }, function() {
                         var token = uuid.v4();
 
                         dynamodb.updateItem({
                             TableName: "TaskManager_Users",
                             Key: {
-                                Email: data.Item.Email
+                                Email: {S: email}
                             },
                             ExpressionAttributeNames: {
                                 "#token": "Token",
@@ -1368,55 +1523,6 @@ login = function(event, context) {
         });
     } else {
         fail_message(event, context, "Please provide an email");
-    }
-}
-
-slack_login = function(event, context) {
-    if (event.user_name != undefined && event.user_name != "") {
-        dynamodb.getItem({
-            TableName: "TaskManager_Users",
-            Key: {
-                Username: {S: event.user_name}
-            }
-        }, function(err, data) {
-            if (err) {
-                console.log(err);
-                context.succeed({text: "Failed to login, please try again later"});
-            } else {
-                if (!data.Item.Username.S) {
-                    context.succeed({text: "Failed to login"});
-                } else {
-                    log_event(data.Item.Username.S, event.action, {}, function() {
-                        dynamodb.updateItem({
-                            TableName: "TaskManager_Users",
-                            Key: {
-                                Username: {S: event.user_name}
-                            },
-                            ExpressionAttributeNames: {
-                                "#slack_user_id": "SlackUserId",
-                                "#status": "Status",
-                                "#token": "Token"
-                            },
-                            ExpressionAttributeValues: {
-                                ":slack_user_id": {S: event.user_id},
-                                ":last_logged_in": {N: (new Date()).getTime().toString()},
-                                ":status": {N: UserStatus.IS_LOGGEDIN.toString()}
-                            },
-                            UpdateExpression: "SET #slack_user_id = :slack_user_id, #status = :status, LastLoggedIn = :last_logged_in REMOVE #token"
-                        }, function(err, data) {
-                            if (err) {
-                                console.log(err);
-                                context.succeed({text: "Failed to login, please try again later"});
-                            } else {
-                                context.succeed({text: "You are now logged in! You can start working."});
-                            }
-                        });
-                    });
-                }
-            }
-        });
-    } else {
-        fail_message(event, context, "Please access this from Slack!");
     }
 }
 
@@ -1475,105 +1581,99 @@ done = function(event, context, user_id) {
 }
 
 logout = function(event, context, user_id) {
-    if (event.is_slack) {
-        dynamodb.updateItem({
-            TableName: "TaskManager_Users",
-            Key: {
-                Email: {S: user_id}
-            },
-            ExpressionAttributeNames: {
-                "#slack_user_id": "SlackUserId",
-                "#status": "Status"
-            },
-            ExpressionAttributeValues: {
-                ":status": {N: UserStatus.IS_LOGGEDOUT.toString()}
-            },
-            UpdateExpression: "SET #status = :status REMOVE #slack_user_id"
-        }, function(err, data) {
-            if (err) {
-                console.log(err);
-                context.succeed({text: "Oops... something failed, please try again later"});
-            } else {
-                log_event(user_id, event.action, {}, function() {
-                    context.succeed({text: "You have just logged out! See you again"});
-                });
-            }
-        });
-    } else {
-        dynamodb.updateItem({
-            TableName: "TaskManager_Users",
-            Key: {
-                Email: {S: user_id}
-            },
-            ExpressionAttributeNames: {
-                "#token": "Token",
-                "#status": "Status"
-            },
-            ExpressionAttributeValues: {
-                ":status": {N: UserStatus.IS_LOGGEDOUT.toString()}
-            },
-            UpdateExpression: "SET #status = :status REMOVE #token"
-        }, function(err, data) {
-            if (err) {
-                console.log(err);
-                fail_message(event, context, "Oops... something failed, please try again later");
-            } else {
-                log_event(user_id, event.action, {}, function() {
-                    context.succeed();
-                });
-            }
-        });
-    }
-}
-
-get_user_id = function(event, context, callback) {
-    var result = "";
-    if (event.current_user) {
-        result = event.current_user;
-    }
-
-    callback(result);
-}
-
-list_available = function(event, context) {
-    dynamodb.query({
-        TableName: "TaskManager_Tasks",
+    dynamodb.updateItem({
+        TableName: "TaskManager_Users",
+        Key: {
+            Email: {S: user_id}
+        },
         ExpressionAttributeNames: {
+            "#token": "Token",
             "#status": "Status"
         },
         ExpressionAttributeValues: {
-            ":status": {N: TaskStatus.IN_QUEUE.toString()}
+            ":status": {N: UserStatus.IS_LOGGEDOUT.toString()}
         },
-        KeyConditionExpression: "#status = :status",
-        ScanIndexForward: false,
-        IndexName: "Status-Deadline-index"
+        UpdateExpression: "SET #status = :status REMOVE #token"
     }, function(err, data) {
         if (err) {
             console.log(err);
-            fail_message(event, context, "Failed to list available tasks, please try again later");
+            fail_message(event, context, "Oops... something failed, please try again later");
         } else {
-            var result = [];
-            if (data.Items.length > 0) {
-                var maximum = 1;
-                if (event.n != undefined && event.n != "") {
-                    var n = parseInt(event.n);
-                    if (!isNaN(n)) {
-                        if (data.Items.length < n) {
-                            maximum = data.Items.length;
-                        } else {
-                            maximum = n;
-                        }
-                    }
-                }
-                for (var task_index = 0; task_index < maximum; task_index++) {
-                    var task = data.Items[task_index];
-                    result.push(format_task_item(task));
-                }
-            }
-
-            context.succeed(result);
+            log_event(user_id, event.action, {}, function() {
+                context.succeed();
+            });
         }
     });
+}
+
+sudo = function(event, context, user_id) {
+    // @Cleanup: We obviously will have already retrieved the user item, so just pass it around
+    // until we get it here
+    dynamodb.getItem({
+        TableName: "TaskManager_Users",
+        Key: {
+            Email: {S: event.current_user}
+        }
+    }, function(err, data) {
+        if (err) {
+            console.log(err);
+            fail_message(event, context, "Oops... something went wrong!");
+        } else {
+            var user = data.Item;
+            if (user && user.SuperUser && user.SuperUser.BOOL) {
+                log_event(user_id, "sudo", {"TargetUser": event.target_user}, function() {
+                    dynamodb.updateItem({
+                        TableName: "TaskManager_Users",
+                        Key: {
+                            Email: {S: event.current_user}
+                        },
+                        ExpressionAttributeNames: {
+                            "#effective_user": "EffectiveUser"
+                        },
+                        ExpressionAttributeValues: {
+                            ":effective_user": {S: event.target_user}
+                        },
+                        UpdateExpression: "SET #effective_user = :effective_user",
+                    }, function(err, data) {
+                        if (err) {
+                            console.log(err);
+                            fail_message(event, context, "Oops, something went wrong!");
+                        } else {
+                            context.succeed(true);
+                        }
+                    });
+                });
+            } else {
+                fail_message(event, context, "You don't have the permission to do this!");
+            }
+        }
+    });
+}
+
+get_user_id = function(event, context, callback) {
+    if (event.current_user) {
+        dynamodb.getItem({
+            TableName: "TaskManager_Users",
+            Key: {
+                Email: {S: event.current_user}
+            }
+        }, function(err, data) {
+            if (err) {
+                console.log(err);
+                fail_message(event, context, "Oops... something went wrong!");
+            } else {
+                var user = event.current_user;
+                if (data.Item) {
+                    if (data.Item.EffectiveUser != undefined && data.Item.EffectiveUser.S != "") {
+                        user = data.Item.EffectiveUser.S;
+                    }
+                }
+                callback(user);
+            }
+        });
+    } else {
+        callback("");
+    }
 }
 
 list = function(event, context) {
@@ -1582,7 +1682,7 @@ list = function(event, context) {
     };
     var attribute_values = {
     };
-    var filter_expression = ["#status = :status"];
+    var filter_expression = [];
     if (event.status != undefined && event.status != "") {
         var status = TaskStatus.IN_QUEUE;
         switch (event.status.toLowerCase()) {
@@ -1612,21 +1712,29 @@ list = function(event, context) {
         filter_expression.push("#owner = :owner");
     }
     if (event.tag != undefined && event.tag != "") {
-        attribute_names["#tag"] = "Tag";
+        attribute_names["#tag"] = "Tags";
         attribute_values[":tag"] = {S: event.tag};
         filter_expression.push("contains(#tag, :tag)");
     }
-    dynamodb.scan({
+    var params = {
         TableName: "TaskManager_Tasks",
         ExpressionAttributeNames: attribute_names,
         ExpressionAttributeValues: attribute_values,
-        FilterExpression: filter_expression.join(" and ")
-    }, function(err, data) {
+        IndexName: "Status-Priority-index",
+        KeyConditionExpression: "#status = :status",
+        ScanIndexForward: false,
+    };
+    if (filter_expression.length > 0) {
+        params.FilterExpression = filter_expression.join(" and ");
+    }
+    console.log(params);
+    dynamodb.query(params, function(err, data) {
         if (err) {
             console.log(err);
             fail_message(event, context, "Failed to list tasks, please try again later");
         } else {
             var result = [];
+            console.log(data);
             if (data.Items.length > 0) {
                 var maximum = data.Items.length;
                 if (event.n != undefined && event.n != "") {
@@ -1639,9 +1747,32 @@ list = function(event, context) {
                 } else if (maximum > 100) {
                     maximum = 100;
                 }
-                for (var task_index = 0; task_index < maximum; task_index++) {
+
+                var tasks = {};
+                var priority_index = 0;
+                var prev_priority = -100;
+                for (var task_index = 0; task_index < data.Items.length; task_index++) {
                     var task = data.Items[task_index];
-                    result.push(format_task_item(task));
+                    if (task.priority != prev_priority) {
+                        priority_index++;
+                        prev_priority = task.priority;
+                        if (tasks[priority_index.toString()] == undefined) {
+                            tasks[priority_index.toString()] = [];
+                        }
+                    }
+                    tasks[priority_index.toString()].push(task);
+                }
+
+                for (var priority in tasks) {
+                    if (tasks.hasOwnProperty(priority)) {
+                        tasks[priority].sort(compare_task_by_created_on);
+                        for (var task_index = 0; task_index < tasks[priority].length; task_index++) {
+                            result.push(format_task_item(tasks[priority][task_index]));
+                            if (result.length >= maximum) {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1653,11 +1784,7 @@ list = function(event, context) {
 handle_nonloggedin = function(event, context) {
     switch (event.action) {
         case "login":
-            if (event.is_slack) {
-                slack_login(event, context);
-            } else {
-                login(event, context);
-            }
+            login(event, context);
             break;
         case "events":
             events(event, context);
@@ -1682,6 +1809,12 @@ handle_nonloggedin = function(event, context) {
             break;
         case "history":
             history(event, context);
+            break;
+        case "worker-stats":
+            worker_stats(event, context);
+            break;
+        case "worker-jobs":
+            worker_jobs(event, context);
             break;
         default:
             fail_message(event, context, "Action not found, maybe you're not logged in?");
@@ -1737,6 +1870,9 @@ exports.handler = function(event, context) {
                         break;
                     case "purge":
                         purge(event, context, user_id);
+                        break;
+                    case "sudo":
+                        sudo(event, context, user_id);
                         break;
                     default:
                         fail_message(event, context, "Action not found, maybe you're trying to login again?");

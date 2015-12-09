@@ -1033,8 +1033,8 @@ task_status = function(event, context, user_id) {
     }
 }
 
-get_available_task = function(event, context, n, callback) {
-    dynamodb.query({
+get_available_task = function(event, context, tag, n, callback) {
+    var params = {
         TableName: "TaskManager_Tasks",
         ExpressionAttributeNames: {
             "#status": "Status"
@@ -1045,7 +1045,13 @@ get_available_task = function(event, context, n, callback) {
         KeyConditionExpression: "#status = :status",
         IndexName: "Status-Priority-index",
         ScanIndexForward: false
-    }, function(err, data) {
+    };
+    if (tag != undefined && tag != null && tag != "") {
+        params.ExpressionAttributeNames["#tag"] = "Tags";
+        params.ExpressionAttributeValues[":tag"] = {S: tag};
+        params.FilterExpression = "contains(#tag, :tag)";
+    }
+    dynamodb.query(params, function(err, data) {
         if (err) {
             console.log("Failed to scan available tasks");
             console.log(err);
@@ -1080,7 +1086,7 @@ list_available = function(event, context) {
             n = n_tmp;
         }
     }
-    get_available_task(event, context, n, function(tasks) {
+    get_available_task(event, context, event.tag, n, function(tasks) {
         var result = [];
         for (var task_index = 0; task_index < tasks.length; task_index++) {
             result.push(format_task_item(tasks[task_index]));
@@ -1182,7 +1188,7 @@ grab = function(event, context, user_id) {
             }
         });
     } else {
-        get_available_task(event, context, 1, function(tasks) {
+        get_available_task(event, context, event.tag, 1, function(tasks) {
             grab_task(tasks[0]);
         });
     }

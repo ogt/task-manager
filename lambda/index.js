@@ -493,12 +493,15 @@ worker_jobs = function(event, context) {
         dynamodb.scan({
             TableName: "TaskManager_Tasks",
             ExpressionAttributeNames: {
-                "#grabbed_by": "GrabbedBy"
+                "#grabbed_by": "GrabbedBy",
+                "#status": "Status"
             },
             ExpressionAttributeValues: {
-                ":grabbed_by": {S: event.user_email}
+                ":grabbed_by": {S: event.user_email},
+                ":status_foreground": {N: TaskStatus.FOREGROUND.toString()},
+                ":status_background": {N: TaskStatus.BACKGROUND.toString()},
             },
-            FilterExpression: "#grabbed_by = :grabbed_by"
+            FilterExpression: "#grabbed_by = :grabbed_by AND #status IN (:status_foreground, :status_background)"
         }, function(err, data) {
             if (err) {
                 console.log(err);
@@ -937,12 +940,12 @@ task_status = function(event, context, user_id) {
             });
             break;
         case "release":
-            get_foreground_task(event, context, user_id, function(task) {
-                log_event(user_id, "release", {TaskId: task.TaskId}, function() {
+            release_task = function(task_id) {
+                log_event(user_id, "release", {TaskId: {N: task_id}}, function() {
                     dynamodb.updateItem({
                         TableName: "TaskManager_Tasks",
                         Key: {
-                            TaskId: task.TaskId
+                            TaskId: {N: task_id}
                         },
                         ExpressionAttributeNames: {
                             "#status": "Status",
@@ -964,7 +967,34 @@ task_status = function(event, context, user_id) {
                         }
                     });
                 });
-            });
+            }
+            if (event.task_id) {
+                dynamodb.getItem({
+                    TableName: "TaskManager_Tasks",
+                    Key: {TaskId: {N: event.task_id}}
+                }, function(err, data) {
+                    if (err) {
+                        console.log(err);
+                        fail_message(event, context, "Oops.. something went wrong! Try again later");
+                    } else {
+                        if (data.Item) {
+                            if (!(data.Item.Status.N == TaskStatus.FOREGROUND || data.Item.Status.N == TaskStatus.BACKGROUND)) {
+                                fail_message(event, context, "This task cannot be released!");
+                            } else if (data.Item.GrabbedBy && data.Item.GrabbedBy.S != user_id || !data.Item.GrabbedBy) {
+                                fail_message(event, context, "This task is not yours!");
+                            } else {
+                                release_task(event.task_id.toString());
+                            }
+                        } else {
+                            fail_message(event, context, "Task is not found!");
+                        }
+                    }
+                });
+            } else {
+                get_foreground_task(event, context, user_id, function(task) {
+                    release_task(task.TaskId.N);
+                });
+            }
             break;
         case "complete-success":
             get_foreground_task(event, context, user_id, function(task) {
@@ -1132,9 +1162,11 @@ grab = function(event, context, user_id) {
                             ExpressionAttributeValues: {
                                 ":status": {N: TaskStatus.FOREGROUND.toString()},
                                 ":grabbed_on": {N: (new Date()).getTime().toString()},
-                                ":grabbed_by": {S: user_id}
+                                ":grabbed_by": {S: user_id},
+                                ":status_in_queue": {N: TaskStatus.IN_QUEUE.toString()}
                             },
-                            UpdateExpression: "SET #status = :status, #grabbed_on = :grabbed_on, #grabbed_by = :grabbed_by"
+                            UpdateExpression: "SET #status = :status, #grabbed_on = :grabbed_on, #grabbed_by = :grabbed_by",
+                            ConditionExpression: "#status = :status_in_queue"
                         };
                         dynamodb.updateItem(params, function(err, data) {
                             if (err) {
@@ -1175,7 +1207,7 @@ grab = function(event, context, user_id) {
                 console.log(err);
                 fail_message(event, context, "Oops... something went wrong! Try again later");
             } else {
-                if (data) {
+                if (data.Item) {
                     var task = data.Item;
                     if (task.Status.N != TaskStatus.IN_QUEUE.toString()) {
                         fail_message(event, context, "Task is not in queue!");
@@ -1523,7 +1555,20 @@ login = function(event, context) {
                         });
                     });
                 } else {
-                    fail_message(event, context, "Failed to login");
+                    dynamodb.putItem({
+                        TableName: "TaskManager_Users",
+                        Item: {
+                            Email: {S: event.email}
+                        }
+                    }, function(err, data) {
+                        if (err) {
+                            console.log("Failed to register user on event.email " + event.email);
+                            console.log(err);
+                            fail_message(event, context, "Oops... something went wrong!");
+                        } else {
+                            login(event, context);
+                        }
+                    });
                 }
             }
         });
@@ -1656,7 +1701,7 @@ sudo = function(event, context, user_id) {
     });
 }
 
-get_user_id = function(event, context, callback) {
+get_user_id = function(event, context, callback, requires_start) {
     if (event.current_user) {
         dynamodb.getItem({
             TableName: "TaskManager_Users",
@@ -1665,16 +1710,33 @@ get_user_id = function(event, context, callback) {
             }
         }, function(err, data) {
             if (err) {
+                console.log("get_user_id failed!");
                 console.log(err);
                 fail_message(event, context, "Oops... something went wrong!");
             } else {
+                console.log(data);
                 var user = event.current_user;
                 if (data.Item) {
                     if (data.Item.EffectiveUser != undefined && data.Item.EffectiveUser.S != "") {
                         user = data.Item.EffectiveUser.S;
                     }
+                    callback(user, data.Item);
+                } else {
+                    dynamodb.putItem({
+                        TableName: "TaskManager_Users",
+                        Item: {
+                            Email: {S: user}
+                        }
+                    }, function(err, data) {
+                        if (err) {
+                            console.log("Failed to register user on get_user_id " + event.current_user);
+                            console.log(err);
+                            fail_message(event, context, "Oops... something went wrong!");
+                        } else {
+                            callback(user, data.Item);
+                        }
+                    });
                 }
-                callback(user);
             }
         });
     } else {
@@ -1740,7 +1802,7 @@ list = function(event, context) {
             fail_message(event, context, "Failed to list tasks, please try again later");
         } else {
             var result = [];
-            console.log(data);
+            console.log(data.Items);
             if (data.Items.length > 0) {
                 var maximum = data.Items.length;
                 if (event.n != undefined && event.n != "") {
@@ -1759,15 +1821,17 @@ list = function(event, context) {
                 var prev_priority = -100;
                 for (var task_index = 0; task_index < data.Items.length; task_index++) {
                     var task = data.Items[task_index];
-                    if (task.priority != prev_priority) {
+                    if (task.Priority.N != prev_priority) {
                         priority_index++;
-                        prev_priority = task.priority;
+                        prev_priority = task.Priority.N;
                         if (tasks[priority_index.toString()] == undefined) {
                             tasks[priority_index.toString()] = [];
                         }
                     }
                     tasks[priority_index.toString()].push(task);
                 }
+
+                console.log(tasks);
 
                 for (var priority in tasks) {
                     if (tasks.hasOwnProperty(priority)) {
@@ -1778,6 +1842,10 @@ list = function(event, context) {
                                 break;
                             }
                         }
+                    }
+
+                    if (result.length >= maximum) {
+                        break;
                     }
                 }
             }
@@ -1843,7 +1911,7 @@ exports.handler = function(event, context) {
         }
     }
     if (event.current_user || event.user_id) {
-        get_user_id(event, context, function(user_id) {
+        get_user_id(event, context, function(user_id, user_data) {
             console.log(event);
             if (!user_id) {
                 delete event.token;
@@ -1857,7 +1925,11 @@ exports.handler = function(event, context) {
                         finger(event, context, user_id);
                         break;
                     case "task-status":
-                        task_status(event, context, user_id);
+                        if (user_data.Status.N == UserStatus.IS_LOGGEDIN.toString()) {
+                            task_status(event, context, user_id);
+                        } else {
+                            fail_message(event, context, "Please begin your session before doing this.");
+                        }
                         break;
                     case "update":
                         update(event, context, user_id);
@@ -1872,7 +1944,11 @@ exports.handler = function(event, context) {
                         context.succeed({text: "You are logged in as " + user_id});
                         break;
                     case "grab":
-                        grab(event, context, user_id);
+                        if (user_data.Status.N == UserStatus.IS_LOGGEDIN.toString()) {
+                            grab(event, context, user_id);
+                        } else {
+                            fail_message(event, context, "Please begin your session before doing this.");
+                        }
                         break;
                     case "purge":
                         purge(event, context, user_id);
